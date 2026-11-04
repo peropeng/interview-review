@@ -10,8 +10,33 @@
 **你怎么定位慢 SQL？**  
 先看数据库怎样读和排序。旧访问路径扫描了许多渠道历史记录；月份条件改成时间范围，前两列固定渠道和状态，后面按时间和 ID 组织索引。LIMIT 只限制返回量，不保证只读这些行。测试记录约 2.12 秒到 8.69 毫秒，对照的是同一测试场景；结果比较到具体记录、字段和顺序。
 
+看这个简化查询：第二个时间参数传下月月初，ID 用来稳定同一时刻的顺序。
+
+```sql
+SELECT id, application_no, submit_state, created_at
+FROM acceptance_record
+WHERE channel_code = ? AND submit_state = ?
+  AND created_at >= ? AND created_at < ?
+ORDER BY created_at DESC, id DESC
+LIMIT 50;
+-- 对应联合索引：(channel_code, submit_state, created_at, id)
+```
+
 **模型能自己写库、交付吗？**  
 LangChain4j 的 ChatModel 是模型调用对象；AI Services 把带提示词的 Java 接口接到模型。应用取回 JSON 文本并检查内容。五阶段依次做输入审计、XML 比对、材料生成、数据库处理和 Git 交付。关键操作先确认，暂停时保存阶段和候选结果，确认后继续。上传后长时间等待，改的是把交付后的补充审查放后台，前置检查保留。
+
+看审计接口的最小接法：`model` 已配置，`@V` 将参数放进提示词。返回的仍是文本，程序解析校验后才决定下一步。
+
+```java
+interface AuditReviewer {
+    @UserMessage("审核这些材料：{{audit}}。只返回 JSON。")
+    String review(@V("audit") String auditSummary);
+}
+
+var reviewer = AiServices.builder(AuditReviewer.class)
+    .chatModel(model).build();
+String result = reviewer.review(auditSummary);
+```
 
 ## Token 包秒杀
 
@@ -20,6 +45,21 @@ LangChain4j 的 ChatModel 是模型调用对象；AI Services 把带提示词的
 
 **为什么不是“先查库存、再扣”？**  
 两个请求可能同时读到最后一份。Lua 在 Redis 里把活动、库存、用户占用的检查和写入放在一次执行中。它的原子性指其他命令不能插进来，不等于运行错误会自动撤销已写入的内容。正式订单再由 MySQL 用库存足够的条件更新和唯一约束保护。
+
+下面只截取库存竞争部分。先检查库存和用户，再一次写完库存、占用和流水；流水留给后续补偿用。
+
+```lua
+local stock = tonumber(redis.call('GET', KEYS[1]))
+local user, reservation = ARGV[1], ARGV[2]
+if not stock or stock <= 0 then return 'SOLD_OUT' end
+if redis.call('SISMEMBER', KEYS[2], user) == 1 then
+    return 'DUPLICATE'
+end
+redis.call('DECR', KEYS[1])
+redis.call('SADD', KEYS[2], user)
+redis.call('HSET', KEYS[3], reservation, user)
+return 'RESERVED'
+```
 
 **消息超时就把预扣加回去吗？**  
 不能直接加，消息可能已经到达，只是没收到确认。留订单号和流水核对；消费者提交数据库后再确认消费，重复收到按同一订单处理。已关闭的订单不能被迟到的创建消息恢复。
